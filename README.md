@@ -8,16 +8,16 @@ Why does this work? No idea. Ship it!
 
 ##  Are you affected?
 
-This tool is for users experiencing the specific Linux kernel bug described above. It won't help if you are having a different issue.
+This tool is for users experiencing a specific Linux kernel bug where writeback stalls indefinitely. If you are not experiencing this specific issue, this tool will not help.
 
-If you are affected, you'll see:
+Symptoms include:
 - `watchdog: soft loookup... native_queued_spin_lock_slowpath` in `dmesg`
-- `Workqueue: writeback wb_workfn` blocked on `native_queued_spin_lock_slowpath` (also in `dmesg`)
--  A growing number of `kworker/...+inode_switch_wbs` threads.
+- `Workqueue: writeback wb_workfn` blocked on `native_queued_spin_lock_slowpath`, also in `dmesg`
+- A growing number of `kworker/...+inode_switch_wbs` threads visible in `ps aux`
 
-If your `dmesg` output and `ps aux` match this, this workaround may work. Otherwise most likely not (but feel free to try).
+If your system exhibits these symptoms, this workaround may be effective. Otherwise, it is unlikely to help.
 
-I suspect it might be related to XFS, but have no smoking gun.
+The bug is suspected to be related to XFS, but this is not confirmed.
 
 <details>
 <summary>Example Kernel Trace 1</summary>

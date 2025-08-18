@@ -1,9 +1,10 @@
-// Stuck Writeback Workaround Tool
-//
-// Monitors root-owned kworker/inode_switch_wbs threads and triggers a sync if they get stuck.
-// This is a workaround for a kernel deadlock described in the README.md accompanying this repo.
-//
-// Usage: Run the binary directly.
+//! # Stuck Writeback Workaround
+//!
+//! A userspace daemon to mitigate indefinite `inode_switch_wbs` stalls in the Linux kernel.
+//!
+//! This tool works around a kernel bug where writeback operations stall indefinitely, hogging
+//! gradually more and more CPUs, until there's none left. The daemon monitors `kworker` threads
+//! executing `inode_switch_wbs` that appear stuck and issues a `sync()` to free them up.
 mod system;
 
 use anyhow::Context;
@@ -13,37 +14,50 @@ use std::thread::sleep;
 use std::time::Duration;
 use system::{LiveSystem, System};
 
-/// Polling interval when a kworker is running but not yet stuck.
+/// The polling interval when a matching `kworker` process is running but has not yet exceeded
+/// its time threshold. This is a tight loop to catch it as soon as it does.
 const BUSY_POLLING: Duration = Duration::from_secs(1);
-/// Polling interval after an error.
+
+/// The polling interval after an error has occurred. This is a back-off to prevent spamming
+/// logs with repeated errors.
 const IDLE_POLLING: Duration = Duration::from_secs(60);
-/// On an active system, rescan all processes after this duration to safeguard against missed kernel events.
+
+/// On a busy system, the kernel may drop netlink events. To safeguard against this, we'll
+/// periodically re-scan the full process list to ensure we haven't missed a stuck `kworker`.
 const MAX_MONITOR_DURATION: Duration = Duration::from_secs(60);
-/// After a sync, we'll wait for this duration before checking again.
+
+/// After triggering a `sync`, we'll pause monitoring for this duration to allow the system to
+/// recover and stabilize.
 const EXPECTED_RECOVERY_TIME: Duration = Duration::from_secs(30);
 
 /// Command-line arguments
 #[derive(argh::FromArgs, Debug)]
-/// Monitors kworker/inode_switch_wbs threads and triggers sync if stuck.
+/// Monitors `kworker` threads and triggers a system-wide `sync` if they appear to be stuck.
+/// This is a workaround for a kernel bug where writeback operations can stall indefinitely.
 #[argh(help_triggers("-h", "--help"))]
 struct Args {
-    /// glob pattern for the kworker comm field.
+    /// a glob pattern to identify the target `kworker` process names.
     #[argh(option, default = "String::from(\"kworker/*inode_switch_wbs*\")")]
     process_glob: String,
-    /// how long a matching worker can run before a sync is triggered.
+
+    /// the maximum permissible runtime for a monitored `kworker` process before a `sync` is
+    /// triggered. The value is parsed as a human-readable duration (e.g., "30s", "1m").
     #[argh(
         option,
         from_str_fn(parse_duration),
         default = "chrono::Duration::seconds(30)"
     )]
     runtime_threshold: chrono::Duration,
-    /// increase output verbosity (info).
+
+    /// enables INFO-level logging.
     #[argh(switch, short = 'v')]
     verbose: bool,
-    /// maximum output verbosity (debug).
+
+    /// enables DEBUG-level logging for maximum verbosity.
     #[argh(switch, short = 'd')]
     debug: bool,
-    /// disable timestamps in logs.
+
+    /// omits timestamps from log output.
     #[argh(switch)]
     no_timestamps: bool,
 }
@@ -59,10 +73,14 @@ impl Args {
 }
 
 fn parse_duration(s: &str) -> Result<chrono::Duration, String> {
-    let d = humantime::parse_duration(s).map_err(|e| format!("Invalid duration: {e}"))?;
-    chrono::Duration::from_std(d).map_err(|e| format!("Duration conversion error: {e}"))
+    let d = humantime::parse_duration(s).map_err(|e| format!("invalid duration: {e}"))?;
+    chrono::Duration::from_std(d).map_err(|e| format!("duration conversion error: {e}"))
 }
 
+/// The core logic of the workaround.
+///
+/// This function scans for `kworker` processes, checks if they are stuck, and triggers a `sync`
+/// if necessary. It returns the recommended duration to wait before the next check.
 fn workaround<T: System>(
     system: &T,
     process_glob: &str,
@@ -72,7 +90,7 @@ fn workaround<T: System>(
 
     let oldest_kworker = system
         .find_oldest_kworker(is_kworker)
-        .context("Failed to find oldest kworker")?;
+        .context("failed to scan for matching kworker processes")?;
 
     if let Some(kworker) = oldest_kworker {
         let now = system.now();
@@ -81,7 +99,7 @@ fn workaround<T: System>(
 
         if oldest_runtime > *runtime_threshold {
             warn!(
-                "Sync triggered: oldest kworker {} has been running for {}s (threshold: {}s)",
+                "Sync triggered: oldest kworker '{}' has been running for {}s (threshold: {}s)",
                 kworker.comm,
                 oldest_runtime.num_seconds(),
                 runtime_threshold.num_seconds()
@@ -92,10 +110,10 @@ fn workaround<T: System>(
             Ok(BUSY_POLLING)
         }
     } else {
-        info!("No kworker found, waiting for new kworker via cn_proc");
+        info!("No matching kworkers found, waiting for a new one to appear");
         system
             .wait_for_kworker(is_kworker, MAX_MONITOR_DURATION)
-            .context("wait_for_kworker error")?;
+            .context("failed to wait for kworker process")?;
         Ok(Duration::from_secs(0))
     }
 }
@@ -111,8 +129,8 @@ fn init_logger(args: &Args) -> anyhow::Result<()> {
         .filter_level(log_level)
         .format_timestamp(timestamp_precision)
         .format_target(false)
-        .try_init()?;
-    Ok(())
+        .try_init()
+        .context("failed to initialize logger")
 }
 
 fn main() -> anyhow::Result<()> {
@@ -126,7 +144,7 @@ fn main() -> anyhow::Result<()> {
         {
             Ok(duration) => duration,
             Err(e) => {
-                error!("{e}");
+                error!("An error occurred: {e:?}");
                 IDLE_POLLING
             }
         };
