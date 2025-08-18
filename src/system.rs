@@ -1,51 +1,61 @@
-//! System monitoring for the stuck writeback workaround tool.
+//! Provides abstractions for system interactions, allowing for easier testing and mocking.
 use anyhow::{Context, Result};
 use cnproc::{PidEvent, PidMonitor};
 use log::debug;
 use procfs::process::{all_processes, Process};
 use procfs::WithCurrentSystemInfo;
 
-/// Information about a process.
+/// Contains essential information about a process for the purpose of this tool.
 #[derive(Debug, Clone)]
 pub struct ProcInfo {
     /// The user ID of the process.
     pub uid: u32,
-    /// The start time of the process.
+    /// The time the process started.
     pub starttime: chrono::DateTime<chrono::Local>,
-    /// The command name of the process.
+    /// The command associated with the process.
     pub comm: String,
 }
 
-/// A predicate for identifying kworker processes.
+/// A predicate used to identify `kworker` processes that should be monitored.
+///
+/// This trait is used as a bound for the `is_kworker` closure, allowing for more structured
+/// and testable code.
 pub trait IsKworkerFn: Fn(&ProcInfo) -> bool {}
 impl<T: Fn(&ProcInfo) -> bool> IsKworkerFn for T {}
 
-/// A trait for system interactions, allowing for mock implementations for testing.
+/// Defines the contract for system-level operations required by the workaround.
+///
+/// This trait allows for a mock implementation to be used during testing, isolating the core
+/// logic from actual system calls.
 pub trait System {
-    /// Finds the oldest process matching the predicate.
+    /// Finds the oldest running process that matches the given predicate.
     fn find_oldest_kworker<F: IsKworkerFn>(&self, is_kworker: F) -> Result<Option<ProcInfo>>;
-    /// Returns the current time.
+    /// Returns the current system time.
     fn now(&self) -> chrono::DateTime<chrono::Local>;
-    /// Waits for a new kworker process to appear using the `cnproc` kernel connector.
+    /// Blocks until a new `kworker` process appears or a timeout occurs.
     ///
-    /// This avoids polling to prevent waking an idle system. On an active system, the `timeout`
-    /// forces a periodic full process scan to safeguard against missed kernel events.
+    /// This method uses the `cnproc` kernel connector to avoid busy-polling, which is more
+    /// efficient. The `timeout` ensures that even on a busy system where kernel events might be
+    /// missed, a full process scan is periodically performed.
     fn wait_for_kworker<F: IsKworkerFn>(
         &self,
         is_kworker: F,
         timeout: std::time::Duration,
     ) -> Result<()>;
-    /// Triggers a system-wide sync.
+    /// Triggers a system-wide `sync` to flush filesystem buffers.
     fn sync(&self);
 }
 
-/// The live system implementation.
+/// The production implementation of the `System` trait, interacting with the live system.
 pub struct LiveSystem;
 
 fn to_proc_info(p: Process) -> Result<ProcInfo> {
-    let stat = p.stat().context("Failed to get stat")?;
-    let uid = p.uid().context("Failed to get uid")?;
-    let starttime = stat.starttime().get().context("Failed to get starttime")?;
+    let stat = p.stat().context("failed to read process stat")?;
+    let uid = p.uid().context("failed to read process uid")?;
+    let starttime = stat
+        .starttime()
+        .get()
+        .context("failed to get process start time")?;
     Ok(ProcInfo {
         uid,
         comm: stat.comm,
@@ -55,7 +65,7 @@ fn to_proc_info(p: Process) -> Result<ProcInfo> {
 
 impl System for LiveSystem {
     fn find_oldest_kworker<F: IsKworkerFn>(&self, is_kworker: F) -> Result<Option<ProcInfo>> {
-        let processes = all_processes().context("Failed to get all processes")?;
+        let processes = all_processes().context("failed to list all processes")?;
         let oldest_kworker = processes
             .filter_map(Result::ok)
             .filter_map(|p| to_proc_info(p).ok())
@@ -73,18 +83,20 @@ impl System for LiveSystem {
         is_kworker: F,
         timeout: std::time::Duration,
     ) -> Result<()> {
-        let mut monitor = PidMonitor::new().context("Failed to create PidMonitor")?;
+        let mut monitor =
+            PidMonitor::new().context("failed to create process event monitor (cnproc)")?;
         let start = std::time::Instant::now();
         loop {
-            // Rescan after a timeout on an active system to safeguard against missed kernel events.
+            // On a busy system, the kernel may drop netlink events. To safeguard against this,
+            // we'll periodically re-scan the full process list.
             if start.elapsed() >= timeout {
-                debug!("wait_for_kworker used for {timeout:?}, checking full list of processes");
+                debug!("wait_for_kworker timed out after {timeout:?}, forcing a full process scan");
                 return Ok(());
             }
 
             let event = monitor
                 .recv()
-                .context("PidMonitor socket closed unexpectedly")?;
+                .context("failed to receive process event from kernel")?;
 
             let pid = match event {
                 PidEvent::Exec { process_pid, .. } => process_pid,
@@ -96,7 +108,7 @@ impl System for LiveSystem {
                 if let Ok(info) = to_proc_info(proc) {
                     if is_kworker(&info) {
                         debug!(
-                            "Found kworker (pid {}, comm: {}), returning",
+                            "Detected matching kworker (pid {}, comm: '{}'), returning",
                             pid, info.comm
                         );
                         return Ok(());
